@@ -24,37 +24,54 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
-type MsgType int
-
 var (
 	BadMsgType = errors.New("Bad message type!")
 	NoMoreTask = errors.New("No more task left!")
 )
 
 
+type RequestType int
+type ReplyType int
+type TaskResult int
+
 const (
-	AskForTask 	MsgType = iota
-	MapTaskAlloc
-	ReduceTaskAlloc
-	MapSuccess
-	MapFailed
-	ReduceSuccess
-	ReduceFailed
-	Shutdown
-	Wait
+    // 请求类型
+    ReqAskForTask RequestType = iota
+    ReqReportTask
+)
+
+const (
+    // 回复类型
+    RplMapTaskAlloc ReplyType = iota
+    RplReduceTaskAlloc
+    RplWait
+    RplShutdown
+)
+
+const (
+    // 任务结果
+    MapSuccess TaskResult = iota
+    MapFailed
+    ReduceSuccess
+    ReduceFailed
 )
 
 type MessageSend struct {
-	MsgType MsgType
-	TaskId int
+    ReqType   RequestType
+    TaskId    int
+    TaskName  string
+    Result    TaskResult
+    ErrMsg    string
 }
 
 type MessageReply struct {
-	Msgtype MsgType
-	TaskId int
-	NReduce int
-	TaskName string
+    RplType   ReplyType
+    TaskId    int
+    TaskName  string // map 任务时带上文件名
+    NReduce   int
+    NMap      int    // 如果 reduce 需要知道 map 数量
 }
+
 
 
 

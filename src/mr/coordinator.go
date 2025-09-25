@@ -14,35 +14,34 @@ import (
 type taskStatus int
 
 const (
-	idle 	taskStatus = iota
+	idle taskStatus = iota
 	running
 	finished
 	failed
 )
 
 type MapTaskInfo struct {
-	TaskId int
-	Status taskStatus
+	TaskId    int
+	Status    taskStatus
 	StartTime int64
 }
 
 type ReduceTaskInfo struct {
-	Status taskStatus
+	Status    taskStatus
 	StartTime int64
 }
 
 type Coordinator struct {
-	// Your definitions here.
-	NReduce 		int
-	MapTasks 		map[string]*MapTaskInfo
-	MapSuccess 		bool
-	ReduceTasks 	[]*ReduceTaskInfo
-	ReduceSuccess 	bool
-	muMap 			sync.Mutex
-	muReuce 		sync.Mutex
+	NReduce       int
+	MapTasks      map[string]*MapTaskInfo
+	MapSuccess    bool
+	ReduceTasks   []*ReduceTaskInfo
+	ReduceSuccess bool
+	muMap         sync.Mutex
+	muReduce      sync.Mutex
 }
 
-func (c *Coordinator) initTasks (files []string) {
+func (c *Coordinator) initTasks(files []string) {
 	for idx, filename := range files {
 		c.MapTasks[filename] = &MapTaskInfo{
 			TaskId: idx,
@@ -55,135 +54,145 @@ func (c *Coordinator) initTasks (files []string) {
 			Status: idle,
 		}
 	}
-} 
+}
 
-// Your code here -- RPC handlers for the worker to call.
-
-func (c *Coordinator) AskForTask(send *MessageSend, reply *MessageReply) bool {
-	if send.MsgType != AskForTask {
-		return false
+// AskForTask is an RPC handler for workers requesting tasks.
+func (c *Coordinator) AskForTask(send *MessageSend, reply *MessageReply) error {
+	// 检查请求类型：期望是请求任务
+	if send.ReqType != ReqAskForTask {
+		return BadMsgType
 	}
+
 	if !c.MapSuccess {
 		c.muMap.Lock()
+		countMapSuccess := 0
 
-		count_map_success := 0
 		for filename, taskinfo := range c.MapTasks {
 			alloc := false
 			if taskinfo.Status == idle || taskinfo.Status == failed {
 				alloc = true
 			} else if taskinfo.Status == running {
 				curTime := time.Now().Unix()
-				if curTime - taskinfo.StartTime > 10 {
+				if curTime-taskinfo.StartTime > 10 {
 					taskinfo.StartTime = curTime
 					alloc = true
 				}
 			} else {
-				count_map_success ++
+				countMapSuccess++
 			}
 
 			if alloc {
-				reply.Msgtype = MapTaskAlloc
+				reply.RplType = RplMapTaskAlloc
 				reply.TaskName = filename
 				reply.NReduce = c.NReduce
 				reply.TaskId = taskinfo.TaskId
 
 				taskinfo.StartTime = time.Now().Unix()
 				taskinfo.Status = running
+
 				c.muMap.Unlock()
-				return true
+				return nil
 			}
 		}
 
 		c.muMap.Unlock()
 
-		if count_map_success < len(c.MapTasks) {
-			reply.Msgtype = Wait
-			return true
+		if countMapSuccess < len(c.MapTasks) {
+			reply.RplType = RplWait
+			return nil
 		} else {
 			c.MapSuccess = true
 		}
 	}
 
 	if !c.ReduceSuccess {
-		c.muReuce.Lock()
+		c.muReduce.Lock()
+		countReduceSuccess := 0
 
-		count_reduce_success := 0
 		for idx, taskinfo := range c.ReduceTasks {
 			alloc := false
 			if taskinfo.Status == idle || taskinfo.Status == failed {
 				alloc = true
 			} else if taskinfo.Status == running {
 				curTime := time.Now().Unix()
-				if curTime - taskinfo.StartTime > 10 {
+				if curTime-taskinfo.StartTime > 10 {
 					taskinfo.StartTime = curTime
 					alloc = true
 				}
 			} else {
-				count_reduce_success++
+				countReduceSuccess++
 			}
 
 			if alloc {
-				reply.Msgtype = ReduceTaskAlloc
+				reply.RplType = RplReduceTaskAlloc
 				reply.TaskId = idx
-				
+
 				taskinfo.Status = running
 				taskinfo.StartTime = time.Now().Unix()
 
-				c.muReuce.Unlock()
-				return true
+				c.muReduce.Unlock()
+				return nil
 			}
 		}
-		c.muReuce.Unlock()
+		c.muReduce.Unlock()
 
-		if count_reduce_success < len(c.ReduceTasks) {
-			reply.Msgtype = Wait
-			return true
+		if countReduceSuccess < len(c.ReduceTasks) {
+			reply.RplType = RplWait
+			return nil
 		} else {
 			c.ReduceSuccess = true
 		}
-
 	}
 
-	reply.Msgtype = Shutdown
-	return true
+	reply.RplType = RplShutdown
+	return nil
 }
 
-func (c *Coordinator) NoticeResult(send *MessageSend, reply *MessageReply) bool {
-	if send.MsgType == MapSuccess {
+// NoticeResult is an RPC handler for workers reporting results.
+func (c *Coordinator) NoticeResult(send *MessageSend, reply *MessageReply) error {
+	// 这里使用 send.Result（TaskResult）来判断是哪种上报结果
+	switch send.Result {
+	case MapSuccess:
 		c.muMap.Lock()
 		for _, v := range c.MapTasks {
 			if v.TaskId == send.TaskId {
 				v.Status = finished
 				c.muMap.Unlock()
-				return true
+				return nil
 			}
 		}
 		c.muMap.Unlock()
-	} else if send.MsgType == ReduceSuccess {
-		c.muReuce.Lock()
+
+	case ReduceSuccess:
+		c.muReduce.Lock()
 		c.ReduceTasks[send.TaskId].Status = finished
-		c.muReuce.Unlock()
-		return true
-	} else if send.MsgType == MapFailed {
+		c.muReduce.Unlock()
+		return nil
+
+	case MapFailed:
 		c.muMap.Lock()
 		for _, v := range c.MapTasks {
 			if v.TaskId == send.TaskId && v.Status == running {
 				v.Status = failed
 				c.muMap.Unlock()
-				return true
+				return nil
 			}
+			// 注意：该 Unlock 在原代码中位于循环体内（保持原逻辑）
 			c.muMap.Unlock()
 		}
-	} else if send.MsgType == ReduceFailed {
-		c.muReuce.Lock()
+
+	case ReduceFailed:
+		c.muReduce.Lock()
 		if c.ReduceTasks[send.TaskId].Status == running {
 			c.ReduceTasks[send.TaskId].Status = failed
 		}
-		c.muReuce.Unlock()
-		return true
+		c.muReduce.Unlock()
+		return nil
 	}
-	return true
+
+	return nil
 }
+
 
 //
 // an example RPC handler.

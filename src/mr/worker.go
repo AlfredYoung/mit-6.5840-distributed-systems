@@ -9,8 +9,9 @@ import (
 	"net/rpc"
 	"os"
 	"sort"
-	"strconv"
+	// "strconv"
 	"time"
+	"path/filepath"
 )
 
 //
@@ -46,129 +47,176 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	for {
-		replyMsg := CallForTask()
+		args := GetTaskArgs{}
+		reply := GetTaskReply{}
 
-		switch replyMsg.RplType {
-		case RplMapTaskAlloc:
-			err := HandleMapTask(replyMsg, mapf)
-			if err == nil {
-				_ = CallForReportStatus(MapSuccess, replyMsg.TaskId)
-			} else {
-				_ = CallForReportStatus(MapFailed, replyMsg.TaskId)
-			}
-
-		case RplReduceTaskAlloc:
-			err := HandleReduceTask(replyMsg, reducef)
-			if err == nil {
-				_ = CallForReportStatus(ReduceSuccess, replyMsg.TaskId)
-			} else {
-				_ = CallForReportStatus(ReduceFailed, replyMsg.TaskId)
-			}
-
-		case RplWait:
-			time.Sleep(10 * time.Second)
-
-		case RplShutdown:
-			os.Exit(0)
+		ok := call("Coordinator.GetTask", &args, &reply)
+		// if coordinator has exited
+		if !ok {
+			return 
 		}
 
-		time.Sleep(time.Second)
+		switch reply.TaskType {
+		case TaskMap:
+			if err := doMapTask(&reply, mapf); err == nil {
+				reportMapDone(reply.MapTaskID)
+			}
+		case TaskReduce:
+			 if err := doReduceTask(&reply, reducef); err == nil {
+				reportReduceDone(reply.ReduceTaskID)
+			}
+		case TaskNone:
+			time.Sleep(time.Millisecond * 100)
+		case TaskExit:
+			return
+		}
 	}
 }
 
-// HandleMapTask executes a map task and generates intermediate files.
-func HandleMapTask(reply *MessageReply, mapf func(string, string) []KeyValue) error {
-	file, err := os.Open(reply.TaskName)
+// doMapTask
+func doMapTask(task *GetTaskReply, mapf func(string, string) []KeyValue) error {
+	// read input file
+	filename := task.FileName
+	content, err := os.ReadFile(filename)
 	if err != nil {
-		return err
+		return fmt.Errorf("cannot read %v: %v", filename, err)
 	}
-	defer file.Close()
+	// call mapf
+	kva := mapf(filename, string(content))
 
-	content, err := io.ReadAll(file)
-	if err != nil {
-		return err
-	}
-
-	kva := mapf(reply.TaskName, string(content))
-	sort.Sort(ByKey(kva))
-
-	tempFiles := make([]*os.File, reply.NReduce)
-	encoders := make([]*json.Encoder, reply.NReduce)
-
+	// partition kva into nReduce intermediate files
+	nReduce := task.NReduce
+	buckets := make([][]KeyValue, nReduce)
 	for _, kv := range kva {
-		redID := ihash(kv.Key) % reply.NReduce
-		if encoders[redID] == nil {
-			tempFile, err := os.CreateTemp("", fmt.Sprintf("mr-map-tmp-%d", redID))
-			if err != nil {
-				return err
-			}
-			defer tempFile.Close()
-			tempFiles[redID] = tempFile
-			encoders[redID] = json.NewEncoder(tempFile)
-		}
-		if err := encoders[redID].Encode(&kv); err != nil {
-			return err
-		}
+		r := ihash(kv.Key) % nReduce
+		buckets[r] = append(buckets[r], kv)
 	}
 
-	for i, f := range tempFiles {
-		if f != nil {
-			fileName := f.Name()
-			f.Close()
-			newName := fmt.Sprintf("mr-out-%d-%d", reply.TaskId, i)
-			if err := os.Rename(fileName, newName); err != nil {
-				return err
-			}
-		}
-	}
+	// write intermediate files
+    for r, kvs := range buckets {
+        intermediateFile := fmt.Sprintf("mr-%d-%d", task.MapTaskID, r)
+        
+        // 1. create temporary file
+        tmpFile, err := os.CreateTemp(".", "mr-tmp-*")
+        if err != nil {
+            return fmt.Errorf("cannot create temp file: %v", err)
+        }
 
+        // 2. write to temporary file
+        enc := json.NewEncoder(tmpFile)
+        for _, kv := range kvs {
+            if err := enc.Encode(&kv); err != nil {
+                tmpFile.Close()
+                os.Remove(tmpFile.Name()) // write error, remove temp file
+                return fmt.Errorf("cannot encode kv: %v", err)
+            }
+        }
+        
+        // close temporary file
+        tmpFile.Close()
+
+        // 3. atomic rename to final intermediate file
+		// if the rename fails, remove the temp file
+		// if two workers try to do the rename at the same time, only one will succeed
+        if err := os.Rename(tmpFile.Name(), intermediateFile); err != nil {
+            os.Remove(tmpFile.Name())
+            return fmt.Errorf("cannot rename file: %v", err)
+        }
+    }
 	return nil
 }
 
-// HandleReduceTask executes a reduce task by reading intermediate files.
-func HandleReduceTask(reply *MessageReply, reducef func(string, []string) string) error {
-	keyID := reply.TaskId
-	kvs := map[string][]string{}
+// doReduceTask
+func doReduceTask(task *GetTaskReply, reducef func(string, []string) string) error {
+	reduceID := task.ReduceTaskID
+	
+	// refer to mrsequential.go for reduce logic
+	// read intermediate files named "mr-X-reduceID"
+	intermediate := []KeyValue{}
+	files, _ := filepath.Glob(fmt.Sprintf("mr-*-%d", reduceID))
+	for _, fname := range files {
+		f, err := os.Open(fname)
+		if err != nil {
+			return err
+		}
 
-	fileList, err := ReadSpecificFile(keyID, "./")
-	if err != nil {
-		return err
-	}
-
-	for _, file := range fileList {
-		dec := json.NewDecoder(file)
+		dec := json.NewDecoder(f)
 		for {
 			var kv KeyValue
-			if err := dec.Decode(&kv); err != nil {
-				break
+			if err = dec.Decode(&kv); err != nil {
+				if err == io.EOF {
+					break
+				}
+				break 
 			}
-			kvs[kv.Key] = append(kvs[kv.Key], kv.Value)
+			intermediate = append(intermediate, kv)
 		}
-		file.Close()
+		f.Close()
 	}
 
-	var keys []string
-	for key := range kvs {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
+	sort.Sort(ByKey(intermediate))
+	
+	oname := fmt.Sprintf("mr-out-%d", reduceID)
+    // 1. create temporary file
+    tmpFile, err := os.CreateTemp(".", "mr-out-tmp-*")
+    if err != nil {
+        return err
+    }
 
-	oname := "mr-out-" + strconv.Itoa(keyID)
-	ofile, err := os.Create(oname)
-	if err != nil {
-		return err
-	}
-	defer ofile.Close()
+    i := 0
+    for i < len(intermediate) {
+        j := i + 1
+        for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+            j++
+        }
+        values := []string{}
+        for k := i; k < j; k++ {
+            values = append(values, intermediate[k].Value)
+        }
 
-	for _, key := range keys {
-		output := reducef(key, kvs[key])
-		if _, err := fmt.Fprintf(ofile, "%v %v\n", key, output); err != nil {
-			return err
-		}
-	}
+        output := reducef(intermediate[i].Key, values)
+        
+        // 2. write to temporary file
+        if _, err := fmt.Fprintf(tmpFile, "%v %v\n", intermediate[i].Key, output); err != nil {
+             tmpFile.Close()
+             os.Remove(tmpFile.Name())
+             return err
+        }
+        i = j
+    }
+    
+    tmpFile.Close()
 
-	DelFileByReduceId(keyID, "./")
+    // 3. atomic rename to final output file
+    if err := os.Rename(tmpFile.Name(), oname); err != nil {
+        os.Remove(tmpFile.Name())
+        return err
+    }
 	return nil
+}
+
+func reportMapDone(mapTaskID int) {
+	args := ReportTaskArgs {
+		TaskType: TaskMap,
+		MapTaskID: mapTaskID,
+	}
+	reply := ReportTaskReply{}
+	ok := call("Coordinator.ReportTask", &args, &reply)
+	if !ok {
+		return  
+	}
+}
+
+func reportReduceDone(reduceTaskID int) {
+	args := ReportTaskArgs {
+		TaskType: TaskReduce,
+		ReduceTaskID: reduceTaskID,
+	}
+	reply := ReportTaskReply{}
+	ok := call("Coordinator.ReportTask", &args, &reply)
+	if !ok {
+		return  
+	}
 }
 
 //
@@ -200,29 +248,6 @@ func CallExample() {
 	}
 }
 
-// CallForReportStatus sends task result (success/failure) to the coordinator.
-func CallForReportStatus(result TaskResult, taskID int) bool {
-	args := MessageSend{
-		ReqType: ReqReportTask,
-		TaskId:  taskID,
-		Result:  result,
-	}
-
-	return call("Coordinator.NoticeResult", &args, nil)
-}
-
-// CallForTask requests a new task from the coordinator.
-func CallForTask() *MessageReply {
-	args := MessageSend{
-		ReqType: ReqAskForTask,
-	}
-	reply := MessageReply{}
-
-	if call("Coordinator.AskForTask", &args, &reply) {
-		return &reply
-	}
-	return nil
-}
 
 //
 // send an RPC request to the coordinator, wait for the response.

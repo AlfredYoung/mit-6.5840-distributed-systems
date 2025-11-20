@@ -8,7 +8,7 @@ package mr
 
 import "os"
 import "strconv"
-import "errors"
+// import "errors"
 
 //
 // example to show how to declare the arguments
@@ -24,54 +24,39 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
-var (
-	BadMsgType = errors.New("Bad message type!")
-	NoMoreTask = errors.New("No more task left!")
-)
 
-
-type RequestType int
-type ReplyType int
-type TaskResult int
+type TaskType int
 
 const (
-    // 请求类型
-    ReqAskForTask RequestType = iota
-    ReqReportTask
+    TaskNone TaskType = iota    // waiting for task
+    TaskMap                     
+    TaskReduce                  
+    TaskExit                    // all tasks are done
 )
 
-const (
-    // 回复类型
-    RplMapTaskAlloc ReplyType = iota
-    RplReduceTaskAlloc
-    RplWait
-    RplShutdown
-)
-
-const (
-    // 任务结果
-    MapSuccess TaskResult = iota
-    MapFailed
-    ReduceSuccess
-    ReduceFailed
-)
-
-type MessageSend struct {
-    ReqType   RequestType
-    TaskId    int
-    TaskName  string
-    Result    TaskResult
-    ErrMsg    string
+type GetTaskArgs struct {
+    WorkerID int // get assigned by coordinator
 }
 
-type MessageReply struct {
-    RplType   ReplyType
-    TaskId    int
-    TaskName  string // map 任务时带上文件名
-    NReduce   int
-    NMap      int    // 如果 reduce 需要知道 map 数量
+type GetTaskReply struct {
+    TaskType TaskType
+
+    FileName string     // filename for Map task
+    MapTaskID int       
+
+    ReduceTaskID int    
+
+    NReduce int         // Reduce task count
 }
 
+
+type ReportTaskArgs struct {
+    TaskType TaskType
+    MapTaskID int
+    ReduceTaskID int
+}
+
+type ReportTaskReply struct{}
 
 
 

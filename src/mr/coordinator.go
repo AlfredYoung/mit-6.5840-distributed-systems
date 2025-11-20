@@ -10,186 +10,165 @@ import (
 	"time"
 )
 
-
-type taskStatus int
+type TaskState int
 
 const (
-	idle taskStatus = iota
-	running
-	finished
-	failed
+	Idle TaskState = iota
+	InProgress 
+	Completed
 )
 
-type MapTaskInfo struct {
-	TaskId    int
-	Status    taskStatus
-	StartTime int64
+type TaskInfo struct {
+	State TaskState
+	StartTime time.Time
 }
 
-type ReduceTaskInfo struct {
-	Status    taskStatus
-	StartTime int64
-}
+type Phase int
+
+const (
+	MapPhase Phase = iota
+	ReducePhase
+	DonePhase
+)	
 
 type Coordinator struct {
-	NReduce       int
-	MapTasks      map[string]*MapTaskInfo
-	MapSuccess    bool
-	ReduceTasks   []*ReduceTaskInfo
-	ReduceSuccess bool
-	muMap         sync.Mutex
-	muReduce      sync.Mutex
+	files []string 			// input files
+	nReduce int				// number of reduce tasks
+	mapTasks []TaskInfo 	// map tasks info
+	reduceTasks []TaskInfo 	// reduce tasks info
+	phase Phase		  		// current phase
+	mu sync.Mutex
 }
 
-func (c *Coordinator) initTasks(files []string) {
-	for idx, filename := range files {
-		c.MapTasks[filename] = &MapTaskInfo{
-			TaskId: idx,
-			Status: idle,
-		}
-	}
+func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
+    c.mu.Lock()
+    defer c.mu.Unlock()
 
-	for idx := range c.ReduceTasks {
-		c.ReduceTasks[idx] = &ReduceTaskInfo{
-			Status: idle,
-		}
-	}
+    switch c.phase {
+
+    //-------------------------------------------------------------------
+    //                         MAP PHASE
+    //-------------------------------------------------------------------
+    case MapPhase:
+        // 1. proiritize to assign Idle map tasks
+        for i, t := range c.mapTasks {
+            if t.State == Idle {
+                reply.TaskType = TaskMap
+                reply.FileName = c.files[i]
+                reply.MapTaskID = i
+                reply.NReduce = c.nReduce
+                c.mapTasks[i].State = InProgress
+                c.mapTasks[i].StartTime = time.Now()
+                return nil
+            }
+        }
+
+        // 2. retry InProgress map tasks that have timed out
+        for i, t := range c.mapTasks {
+            if t.State == InProgress &&
+                time.Since(t.StartTime) > 10*time.Second {
+
+                // reassign this map task
+                reply.TaskType = TaskMap
+                reply.FileName = c.files[i]
+                reply.MapTaskID = i
+                reply.NReduce = c.nReduce
+                c.mapTasks[i].StartTime = time.Now()
+                return nil
+            }
+        }
+
+        // 3. check if all map tasks are completed
+        allComplete := true
+        for _, t := range c.mapTasks {
+            if t.State != Completed {
+                allComplete = false
+                break
+            }
+        }
+
+        if allComplete {
+            c.phase = ReducePhase
+            reply.TaskType = TaskNone
+            return nil
+        }
+
+        reply.TaskType = TaskNone
+        return nil
+
+    //-------------------------------------------------------------------
+    //                       REDUCE PHASE
+    //-------------------------------------------------------------------
+    case ReducePhase:
+        // 1. proiritize to assign Idle reduce tasks
+        for i, t := range c.reduceTasks {
+            if t.State == Idle {
+                reply.TaskType = TaskReduce
+                reply.ReduceTaskID = i
+                reply.NReduce = c.nReduce
+
+                c.reduceTasks[i].State = InProgress
+                c.reduceTasks[i].StartTime = time.Now()
+                return nil
+            }
+        }
+
+        // 2. retry InProgress reduce tasks that have timed out
+        for i, t := range c.reduceTasks {
+            if t.State == InProgress &&
+                time.Since(t.StartTime) > 10*time.Second {
+
+                reply.TaskType = TaskReduce
+                reply.ReduceTaskID = i
+                reply.NReduce = c.nReduce
+
+                c.reduceTasks[i].StartTime = time.Now()
+                return nil
+            }
+        }
+
+        // 3. check if all reduce tasks are completed
+        allComplete := true
+        for _, t := range c.reduceTasks {
+            if t.State != Completed {
+                allComplete = false
+                break
+            }
+        }
+
+        if allComplete {
+            c.phase = DonePhase
+            reply.TaskType = TaskExit
+            return nil
+        }
+
+        reply.TaskType = TaskNone
+        return nil
+
+    //-------------------------------------------------------------------
+    //                           DONE PHASE
+    //-------------------------------------------------------------------
+    case DonePhase:
+        reply.TaskType = TaskExit
+        return nil
+    }
+
+    return nil
 }
 
-// AskForTask is an RPC handler for workers requesting tasks.
-func (c *Coordinator) AskForTask(send *MessageSend, reply *MessageReply) error {
-	// 检查请求类型：期望是请求任务
-	if send.ReqType != ReqAskForTask {
-		return BadMsgType
-	}
-
-	if !c.MapSuccess {
-		c.muMap.Lock()
-		countMapSuccess := 0
-
-		for filename, taskinfo := range c.MapTasks {
-			alloc := false
-			if taskinfo.Status == idle || taskinfo.Status == failed {
-				alloc = true
-			} else if taskinfo.Status == running {
-				curTime := time.Now().Unix()
-				if curTime-taskinfo.StartTime > 10 {
-					taskinfo.StartTime = curTime
-					alloc = true
-				}
-			} else {
-				countMapSuccess++
-			}
-
-			if alloc {
-				reply.RplType = RplMapTaskAlloc
-				reply.TaskName = filename
-				reply.NReduce = c.NReduce
-				reply.TaskId = taskinfo.TaskId
-
-				taskinfo.StartTime = time.Now().Unix()
-				taskinfo.Status = running
-
-				c.muMap.Unlock()
-				return nil
-			}
+func (c *Coordinator) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch args.TaskType {
+	case TaskMap:
+		if c.mapTasks[args.MapTaskID].State == InProgress {
+			c.mapTasks[args.MapTaskID].State = Completed
 		}
-
-		c.muMap.Unlock()
-
-		if countMapSuccess < len(c.MapTasks) {
-			reply.RplType = RplWait
-			return nil
-		} else {
-			c.MapSuccess = true
+	case TaskReduce:
+		if c.reduceTasks[args.ReduceTaskID].State == InProgress {
+			c.reduceTasks[args.ReduceTaskID].State = Completed
 		}
 	}
-
-	if !c.ReduceSuccess {
-		c.muReduce.Lock()
-		countReduceSuccess := 0
-
-		for idx, taskinfo := range c.ReduceTasks {
-			alloc := false
-			if taskinfo.Status == idle || taskinfo.Status == failed {
-				alloc = true
-			} else if taskinfo.Status == running {
-				curTime := time.Now().Unix()
-				if curTime-taskinfo.StartTime > 10 {
-					taskinfo.StartTime = curTime
-					alloc = true
-				}
-			} else {
-				countReduceSuccess++
-			}
-
-			if alloc {
-				reply.RplType = RplReduceTaskAlloc
-				reply.TaskId = idx
-
-				taskinfo.Status = running
-				taskinfo.StartTime = time.Now().Unix()
-
-				c.muReduce.Unlock()
-				return nil
-			}
-		}
-		c.muReduce.Unlock()
-
-		if countReduceSuccess < len(c.ReduceTasks) {
-			reply.RplType = RplWait
-			return nil
-		} else {
-			c.ReduceSuccess = true
-		}
-	}
-
-	reply.RplType = RplShutdown
-	return nil
-}
-
-// NoticeResult is an RPC handler for workers reporting results.
-func (c *Coordinator) NoticeResult(send *MessageSend, reply *MessageReply) error {
-	// 这里使用 send.Result（TaskResult）来判断是哪种上报结果
-	switch send.Result {
-	case MapSuccess:
-		c.muMap.Lock()
-		for _, v := range c.MapTasks {
-			if v.TaskId == send.TaskId {
-				v.Status = finished
-				c.muMap.Unlock()
-				return nil
-			}
-		}
-		c.muMap.Unlock()
-
-	case ReduceSuccess:
-		c.muReduce.Lock()
-		c.ReduceTasks[send.TaskId].Status = finished
-		c.muReduce.Unlock()
-		return nil
-
-	case MapFailed:
-		c.muMap.Lock()
-		for _, v := range c.MapTasks {
-			if v.TaskId == send.TaskId && v.Status == running {
-				v.Status = failed
-				c.muMap.Unlock()
-				return nil
-			}
-			// 注意：该 Unlock 在原代码中位于循环体内（保持原逻辑）
-			c.muMap.Unlock()
-		}
-
-	case ReduceFailed:
-		c.muReduce.Lock()
-		if c.ReduceTasks[send.TaskId].Status == running {
-			c.ReduceTasks[send.TaskId].Status = failed
-		}
-		c.muReduce.Unlock()
-		return nil
-	}
-
 	return nil
 }
 
@@ -228,23 +207,10 @@ func (c *Coordinator) server() {
 func (c *Coordinator) Done() bool {
 
 	// Your code here.
-	for _, taskinfo := range c.MapTasks {
-		if taskinfo.Status != finished {
-			return false
-		}
-	}
-
-	for _, taskinfo := range c.ReduceTasks {
-		if taskinfo.Status != finished {
-			return false
-		}
-	}
-
-	time.Sleep(time.Second * 3)
-
-	return true
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.phase == DonePhase
 }
-
 //
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
@@ -253,13 +219,14 @@ func (c *Coordinator) Done() bool {
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 	// Your code here.
-	c := Coordinator{
-		NReduce:     nReduce,
-		MapTasks:    make(map[string]*MapTaskInfo),
-		ReduceTasks: make([]*ReduceTaskInfo, nReduce),
-	}
-	c.initTasks(files)
+	c := &Coordinator{}
 
-	c.server()
-	return &c
+	c.files = files
+	c.nReduce = nReduce
+	c.phase = MapPhase
+	
+	c.mapTasks = make([]TaskInfo, len(files))
+	c.reduceTasks = make([]TaskInfo, nReduce)
+	go c.server()
+	return c
 }

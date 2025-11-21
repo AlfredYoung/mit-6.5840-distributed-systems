@@ -35,10 +35,13 @@ func (lk *Lock) Acquire() {
     for {
         value, version, err := lk.ck.Get(lk.key)
         if err == rpc.ErrNoKey {
-            if lk.ck.Put(lk.key, lk.myID, 0) == rpc.OK {
-                return
-            }
-            continue
+            e := lk.ck.Put(lk.key, lk.myID, 0)
+			if e == rpc.OK {
+				return
+			} else if e == rpc.ErrMaybe || e == rpc.ErrVersion {
+				// for ErrMaybe We don't know if we acquired the lock; have to check again
+				continue
+			}
         }
         if err == rpc.OK {
             if value == lk.myID {
@@ -49,10 +52,14 @@ func (lk *Lock) Acquire() {
             if value != "" { 
                 continue
             }
-            // Lock is free (value = ""), try CAS acquire
-            if lk.ck.Put(lk.key, lk.myID, version) == rpc.OK {
-                return
-            }
+            
+			e := lk.ck.Put(lk.key, lk.myID, version)
+			if e == rpc.OK {
+				return
+			} else if e == rpc.ErrMaybe || e == rpc.ErrVersion {
+				// for ErrMaybe We don't know if we acquired the lock; have to check again
+				continue
+			}
         }
     }
 }
@@ -67,17 +74,22 @@ func (lk *Lock) Release() {
 			return
 		}
 		
-		if err == rpc.OK && value == lk.myID {
-			// Try to release the lock
-			err = lk.ck.Put(lk.key, "", version)
-			if err == rpc.OK {
-				// Successfully released the lock
+		if err == rpc.OK {
+			if value != lk.myID {
+				// Lock is held by someone else or release by previous loop; cannot release
 				return
 			}
-			// If err is ErrVersion or ErrMaybe, retry
-		} else {
-			// Lock not held by us, nothing to do
-			return
+
+			e := lk.ck.Put(lk.key, "", version)
+
+			if e == rpc.OK {
+				return
+			} else if e == rpc.ErrMaybe {
+				// for ErrMaybe We don't know if we released the lock; have to check again
+				continue
+			} else {
+				return // for ErrVersion, someone else acquired the lock; cannot release
+			}
 		}
 	}
 }
